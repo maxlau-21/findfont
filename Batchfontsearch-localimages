@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+API 客户端 - 支持本地图片批量识别
+版本: 1.0.7
+"""
+
+import hashlib
+import time
+import os
+import json
+import glob
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Union
+from urllib.parse import urljoin
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+@dataclass
+class ZiYouConfig:
+    base_url: str = "https://hellofontserver001.etrump.net/platform/identifier/"
+    company_code: str = "aa"
+    company_slat: str = "aa"
+    timeout: int = 30
+
+    @classmethod
+    def from_env(cls):
+        return cls(
+            base_url=os.getenv("ZY_BASE_URL", cls.base_url),
+            company_code=os.getenv("ZY_COMPANY_CODE", "test15"),
+            company_slat=os.getenv("ZY_COMPANY_SLAT", "test1111"),
+            timeout=int(os.getenv("ZY_TIMEOUT", "30")),
+        )
+
+
+class ZiYouOCRClient:
+    def __init__(self, config: ZiYouConfig):
+        self.config = config
+
+    def _generate_sign(self, timestamp: int) -> str:
+        raw = f"{self.config.company_code}&{timestamp}&{self.config.company_slat}"
+        return hashlib.md5(raw.encode('utf-8')).hexdigest()
+
+    def _build_headers(self, timestamp: int) -> Dict[str, str]:
+        return {
+            'zy-ts': str(timestamp),
+            'zy-sign': self._generate_sign(timestamp)
+        }
+
+    def _request(self, method, endpoint, params=None, data=None, files=None):
+        url = urljoin(self.config.base_url, endpoint)
+        timestamp = int(time.time() * 1000)
+        headers = self._build_headers(timestamp)
+
+        resp = requests.request(
+            method=method,
+            url=url,
+            headers=headers,
+            params=params,
+            data=data,
+            files=files,
+            timeout=self.config.timeout
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        if not result.get('success', False):
+            raise Exception(f"API error {result.get('error_code')}: {result.get('error_msg')}")
+        return result
+
+    def get_company_info(self, company: Optional[str] = None):
+        company = company or self.config.company_code
+        return self._request('GET', 'company', params={'company': company}).get('result', {})
+
+    def identify_image(self,
+                       image_url: Optional[str] = None,
+                       image_file: Optional[Union[str, bytes]] = None,
+                       company: Optional[str] = None,
+                       raw_response: bool = False) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
+        if not image_url and not image_file:
+            raise ValueError("必须提供 image_url 或 image_file 之一")
+
+        company = company or self.config.company_code
+        data = {'company': company}
+        files = None
+
+        if image_url:
+            data['image_url'] = image_url
+        else:
+            if isinstance(image_file, str):
+                files = {'image_file': (image_file, open(image_file, 'rb'))}
+            else:
+                files = {'image_file': ('image.jpg', image_file)}
+
+        result = self._request('POST', 'identify', data=data, files=files)
+        if raw_response:
+            return result
+        else:
+            return result.get('result', {}).get('text_lines', [])
+
+    def identify_from_path(self, file_path: str, company=None, raw_response=False):
+        return self.identify_image(image_file=file_path, company=company, raw_response=raw_response)
+
+    def identify_from_bytes(self, image_bytes: bytes, company=None, raw_response=False):
+        return self.identify_image(image_file=image_bytes, company=company, raw_response=raw_response)
+
+    def batch_identify(self,
+                       images: List[Dict[str, Any]],
+                       output_file: str,
+                       max_workers: Optional[int] = None,
+                       verbose: bool = True) -> List[Dict[str, Any]]:
+        """
+        批量识别多张图片，并将结果写入 txt 文件（JSON 格式）
+        :param images: 列表，每项为 {"url": "..."} 或 {"file": "/path/..."}
+        :param output_file: 输出 txt 文件路径
+        :param max_workers: 并发线程数，None 表示顺序执行
+        :param verbose: 是否在控制台打印详细日志
+        :return: 结果列表（包含 index, success, response/error, input）
+        """
+        results = []
+
+        def process_one(index, image_item):
+            try:
+                if 'url' in image_item:
+                    resp = self.identify_image(image_url=image_item['url'], raw_response=True)
+                elif 'file' in image_item:
+                    resp = self.identify_image(image_file=image_item['file'], raw_response=True)
+                else:
+                    raise ValueError("图片项必须包含 'url' 或 'file' 键")
+                return {'index': index, 'success': True, 'response': resp, 'input': image_item}
+            except Exception as e:
+                return {'index': index, 'success': False, 'error': str(e), 'input': image_item}
+
+        # 执行识别
+        if max_workers is None:
+            for idx, img in enumerate(images):
+                results.append(process_one(idx, img))
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {executor.submit(process_one, idx, img): idx for idx, img in enumerate(images)}
+                for future in as_completed(future_to_idx):
+                    results.append(future.result())
+
+        # 按原始顺序排序
+        results.sort(key=lambda x: x['index'])
+
+        # 构造写入文件的日志数据（每条记录包含图片地址和完整响应）
+        output_data = []
+        for r in results:
+            if 'url' in r['input']:
+                image_addr = r['input']['url']
+            else:
+                image_addr = r['input'].get('file', '未知文件')
+            if r['success']:
+                output_data.append({
+                    "image": image_addr,
+                    "response": r['response']
+                })
+            else:
+                output_data.append({
+                    "image": image_addr,
+                    "error": r['error']
+                })
+
+        # 确保输出目录存在
+        os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
+
+        # 控制台详细日志
+        if verbose:
+            print("\n" + "=" * 60)
+            print("批量识别详细日志（按图片顺序）")
+            print("=" * 60)
+            for r in results:
+                if 'url' in r['input']:
+                    addr = r['input']['url']
+                else:
+                    addr = r['input'].get('file', '未知文件')
+                print(f"\n📷 图片地址: {addr}")
+                if r['success']:
+                    print("✅ 识别成功，完整 JSON 响应：")
+                    print(json.dumps(r['response'], indent=2, ensure_ascii=False))
+                else:
+                    print(f"❌ 识别失败，错误信息：{r['error']}")
+            print("\n" + "=" * 60)
+            print(f"所有结果已保存至: {output_file}")
+            print("=" * 60)
+
+        return results
+
+
+# ========================= 使用示例 =========================
+if __name__ == '__main__':
+    config = ZiYouConfig()
+    client = ZiYouOCRClient(config)
+
+    # 查询企业剩余次数
+    try:
+        info = client.get_company_info()
+        print(f"✅ 剩余调用次数: {info.get('remains')}")
+    except Exception as e:
+        print(f"❌ 查询失败: {e}")
+
+    # ---------- 本地图片批量识别（自动遍历文件夹） ----------
+    # 请修改为你的本地图片目录
+    image_folder = "D:\\img\\"  # 替换为实际路径
+
+    # 支持的图片扩展名
+    extensions = ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.gif"]
+    image_files = []
+    for ext in extensions:
+        image_files.extend(glob.glob(os.path.join(image_folder, ext)))
+
+    if not image_files:
+        print(f"⚠️ 在 {image_folder} 中未找到任何图片文件，请检查路径。")
+    else:
+        image_list = [{"file": f} for f in image_files]
+        output_txt = "D:\\batch_results_local.txt"  # 可改为任意路径
+
+        print(f"\n开始批量识别 {len(image_list)} 张本地图片...")
+        try:
+            batch_results = client.batch_identify(image_list, output_file=output_txt, max_workers=3, verbose=True)
+            success_count = sum(1 for r in batch_results if r['success'])
+            print(f"\n汇总：成功 {success_count} 张，失败 {len(image_list) - success_count} 张")
+        except Exception as e:
+            print(f"批量识别出错: {e}")
